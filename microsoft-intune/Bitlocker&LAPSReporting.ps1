@@ -1,9 +1,7 @@
-$Global:MicrosoftEntraIDAccessToken = ""
-
 $ErrorActionPreference = "Stop"
 
-if (-not $Global:MicrosoftEntraIDAccessToken) {
-    throw "Global access token not found. Set `$Global:MicrosoftEntraIDAccessToken before running."
+while (-not $Global:MicrosoftEntraIDAccessToken) {
+    $Global:MicrosoftEntraIDAccessToken = Read-Host "Paste a Microsoft Graph access token"
 }
 
 $GraphBaseUri = "https://graph.microsoft.com/v1.0"
