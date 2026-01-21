@@ -1,6 +1,6 @@
 $ErrorActionPreference = "Stop"
 
-while (-not $Global:MicrosoftEntraIDAccessToken) {
+while ([string]::IsNullOrWhiteSpace($Global:MicrosoftEntraIDAccessToken)) {
     $Global:MicrosoftEntraIDAccessToken = Read-Host "Paste a Microsoft Graph access token"
 }
 
@@ -8,9 +8,9 @@ $GraphBaseUri = "https://graph.microsoft.com/v1.0"
 $GraphBetaBaseUri = "https://graph.microsoft.com/beta"
 
 function Request-GraphAccessToken {
-    $newToken = Read-Host "Graph access token expired. Paste a new Microsoft Graph access token"
-    if (-not $newToken) {
-        throw "Token refresh aborted: no token provided."
+    $newToken = $null
+    while ([string]::IsNullOrWhiteSpace($newToken)) {
+        $newToken = Read-Host "Graph access token expired. Paste a new Microsoft Graph access token"
     }
 
     $Global:MicrosoftEntraIDAccessToken = $newToken
@@ -97,6 +97,8 @@ function Get-GraphPaged {
 $managedDevicesUri = "$GraphBaseUri/deviceManagement/managedDevices?`$filter=operatingSystem eq 'Windows'&`$select=id,deviceName,complianceState,azureADDeviceId,operatingSystem"
 $managedDevices = Get-GraphPaged -Uri $managedDevicesUri
 
+$ErrorDevices = @()
+
 $bitlockerByDeviceId = @{}
 foreach ($device in $managedDevices) {
     if (-not $device.azureADDeviceId) {
@@ -106,7 +108,40 @@ foreach ($device in $managedDevices) {
     Write-Host ("[BitLocker] Processing {0} ({1})" -f $device.deviceName, $device.azureADDeviceId)
     $escapedDeviceId = $device.azureADDeviceId.Replace("'", "''")
     $bitlockerKeysUri = "$GraphBetaBaseUri/informationProtection/bitlocker/recoveryKeys?`$filter=deviceId eq '$escapedDeviceId'&`$select=id,deviceId,createdDateTime,volumeType"
-    $bitlockerKeys = Get-GraphPaged -Uri $bitlockerKeysUri
+    try {
+        $bitlockerKeys = Get-GraphPaged -Uri $bitlockerKeysUri
+    }
+    catch {
+        $errorDetails = $_.ErrorDetails.Message
+        $parsedError = $null
+        if ($errorDetails) {
+            try {
+                $parsedError = $errorDetails | ConvertFrom-Json
+            }
+            catch {
+                $parsedError = $null
+            }
+        }
+
+        $isNotFound = $false
+        if ($parsedError -and $parsedError.error) {
+            $isNotFound = $parsedError.error.code -eq "invalid_request" -and $parsedError.error.message -match "could not be found"
+        }
+
+        if (-not $isNotFound) {
+            throw
+        }
+
+        $ErrorDevices += [pscustomobject]@{
+            DeviceName      = $device.deviceName
+            AzureADDeviceId = $device.azureADDeviceId
+            IntuneDeviceId  = $device.id
+            ErrorCode       = $parsedError.error.code
+            ErrorMessage    = $parsedError.error.message
+        }
+        Write-Host ("[BitLocker] Device not found in directory, recorded error for {0}" -f $device.azureADDeviceId)
+        continue
+    }
     if (-not $bitlockerKeys) {
         Write-Host ("[BitLocker] No recovery keys found for {0}" -f $device.azureADDeviceId)
         continue
@@ -130,15 +165,51 @@ foreach ($device in $managedDevices) {
 
     Write-Host ("[LAPS] Processing {0} ({1})" -f $device.deviceName, $device.azureADDeviceId)
     $escapedDeviceId = $device.azureADDeviceId.Replace("'", "''")
-    $lapsUri = "$GraphBaseUri/directory/deviceLocalCredentials/$escapedDeviceId"
-    $lapsEntry = Invoke-GraphRequest -Method GET -Uri $lapsUri
+    $lapsUri = "$GraphBetaBaseUri/directory/deviceLocalCredentials/$escapedDeviceId"
+    try {
+        $lapsEntry = Invoke-GraphRequest -Method GET -Uri $lapsUri
+    }
+    catch {
+        $errorDetails = $_.ErrorDetails.Message
+        $parsedError = $null
+        if ($errorDetails) {
+            try {
+                $parsedError = $errorDetails | ConvertFrom-Json
+            }
+            catch {
+                $parsedError = $null
+            }
+        }
+
+        $isNotFound = $false
+        if ($parsedError -and $parsedError.error) {
+            $isNotFound = $parsedError.error.code -eq "invalid_request" -and $parsedError.error.message -match "could not be found"
+        }
+
+        if (-not $isNotFound) {
+            throw
+        }
+
+        $ErrorDevices += [pscustomobject]@{
+            DeviceName      = $device.deviceName
+            AzureADDeviceId = $device.azureADDeviceId
+            IntuneDeviceId  = $device.id
+            ErrorCode       = $parsedError.error.code
+            ErrorMessage    = $parsedError.error.message
+        }
+        Write-Host ("[LAPS] Device not found in directory, recorded error for {0}" -f $device.azureADDeviceId)
+        continue
+    }
     if (-not $lapsEntry) {
         Write-Host ("[LAPS] No credentials found for {0}" -f $device.azureADDeviceId)
         continue
     }
 
-    $lapsByDeviceId[$device.azureADDeviceId] = $lapsEntry.lastPasswordRotationDateTime
-    Write-Host ("[LAPS] Last rotation {0}" -f $lapsEntry.lastPasswordRotationDateTime)
+    $lapsByDeviceId[$device.azureADDeviceId] = [pscustomobject]@{
+        lastBackupDateTime = $lapsEntry.lastBackupDateTime
+        refreshDateTime = $lapsEntry.refreshDateTime
+    }
+    Write-Host ("[LAPS] Last rotation {0}" -f $lapsEntry.lastBackupDateTime)
 }
 
 $Results = foreach ($device in $managedDevices) {
@@ -149,9 +220,9 @@ $Results = foreach ($device in $managedDevices) {
         $bitlockerInfo = $bitlockerByDeviceId[$aadDeviceId]
     }
 
-    $lapsRotation = $null
+    $lapsInfo = $null
     if ($aadDeviceId -and $lapsByDeviceId.ContainsKey($aadDeviceId)) {
-        $lapsRotation = $lapsByDeviceId[$aadDeviceId]
+        $lapsInfo = $lapsByDeviceId[$aadDeviceId]
     }
 
     [pscustomobject]@{
@@ -160,8 +231,10 @@ $Results = foreach ($device in $managedDevices) {
         ComplianceStatus                        = $device.complianceState
         BitlockerRecoveryKeyStatus              = if ($bitlockerInfo) { $bitlockerInfo.Status } else { "Missing" }
         BitlockerRecoveryKeyBackupTimestamp     = if ($bitlockerInfo) { $bitlockerInfo.BackupTimestamp } else { $null }
-        LocalAdminPasswordLastRotationTimestamp = $lapsRotation
+        LocalAdminPasswordLastBackupDateTime    = if ($lapsInfo) { $lapsInfo.lastBackupDateTime } else { $null }
+        LocalAdminPasswordRefreshDateTime       = if ($lapsInfo) { $lapsInfo.refreshDateTime } else { $null }
     }
 }
 
-$Results
+$Results | ogv
+$Results | Export-Csv ".\Bitlocker&LAPSReporting.csv"
